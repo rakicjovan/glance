@@ -42,8 +42,6 @@ type redditWidget struct {
 	CollapseAfter       int               `yaml:"collapse-after"`
 	RequestURLTemplate  string            `yaml:"request-url-template"`
 
-	Filters filterableFields[forumPost] `yaml:"filters"`
-
 	AppAuth struct {
 		Name   string `yaml:"name"`
 		ID     string `yaml:"id"`
@@ -106,15 +104,13 @@ func (widget *redditWidget) update(ctx context.Context) {
 		return
 	}
 
-	posts = widget.Filters.Apply(posts)
+	if len(posts) > widget.Limit {
+		posts = posts[:widget.Limit]
+	}
 
 	if widget.ExtraSortBy == "engagement" {
 		posts.calculateEngagement()
 		posts.sortByEngagement()
-	}
-
-	if len(posts) > widget.Limit {
-		posts = posts[:widget.Limit]
 	}
 
 	widget.Posts = posts
@@ -357,7 +353,7 @@ var redditHTTPClient = &http.Client{Transport: &http2.Transport{
 
 var (
 	redditChallengePattern = regexp.MustCompile(`await\(async \w+\s*=>\s*\w+\s*\+\s*\w+\)\("([^"]+)"\)`)
-	redditTokenPattern     = regexp.MustCompile(`name="token"\s+value="([^"]+)"`)
+	redditTokenPattern     = regexp.MustCompile(`name="jsc_token"\s+value="([^"]+)"`)
 )
 
 // Allows all widget instances to share a single loid cookie, since we don't want to draw
@@ -431,7 +427,7 @@ func fetchRedditLoidCookie() (string, error) {
 	params := url.Values{
 		"solution":     {solution},
 		"js_challenge": {"1"},
-		"token":        {token},
+		"jsc_token":    {token},
 	}
 	request, err = http.NewRequest("GET", "https://www.reddit.com/?"+params.Encode(), nil)
 	if err != nil {

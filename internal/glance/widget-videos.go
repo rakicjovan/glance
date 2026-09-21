@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,7 @@ var (
 type videosWidget struct {
 	widgetBase        `yaml:",inline"`
 	Videos            videoList `yaml:"-"`
+	cachedVideoLists  sync.Map  `yaml:"-"`
 	VideoUrlTemplate  string    `yaml:"video-url-template"`
 	Style             string    `yaml:"style"`
 	CollapseAfter     int       `yaml:"collapse-after"`
@@ -31,61 +33,56 @@ type videosWidget struct {
 	Playlists         []string  `yaml:"playlists"`
 	Limit             int       `yaml:"limit"`
 	IncludeShorts     bool      `yaml:"include-shorts"`
-	SortBy            string    `yaml:"sort-by"`
-
-	Filters filterableFields[video] `yaml:"filters"`
 }
 
-func (widget *videosWidget) initialize() error {
-	widget.withTitle("Videos").withCacheDuration(time.Hour)
+func (w *videosWidget) initialize() error {
+	w.withTitle("Videos").withCacheDuration(time.Hour)
 
-	if widget.Limit <= 0 {
-		widget.Limit = 25
+	if w.Limit <= 0 {
+		w.Limit = 25
 	}
 
-	if widget.CollapseAfterRows == 0 || widget.CollapseAfterRows < -1 {
-		widget.CollapseAfterRows = 4
+	if w.CollapseAfterRows == 0 || w.CollapseAfterRows < -1 {
+		w.CollapseAfterRows = 4
 	}
 
-	if widget.CollapseAfter == 0 || widget.CollapseAfter < -1 {
-		widget.CollapseAfter = 7
+	if w.CollapseAfter == 0 || w.CollapseAfter < -1 {
+		w.CollapseAfter = 7
 	}
 
 	// A bit cheeky, but from a user's perspective it makes more sense when channels and
 	// playlists are separate things rather than specifying a list of channels and some of
 	// them awkwardly have a "playlist:" prefix
-	if len(widget.Playlists) > 0 {
-		initialLen := len(widget.Channels)
-		widget.Channels = append(widget.Channels, make([]string, len(widget.Playlists))...)
+	if len(w.Playlists) > 0 {
+		initialLen := len(w.Channels)
+		w.Channels = append(w.Channels, make([]string, len(w.Playlists))...)
 
-		for i := range widget.Playlists {
-			widget.Channels[initialLen+i] = videosWidgetPlaylistPrefix + widget.Playlists[i]
+		for i := range w.Playlists {
+			w.Channels[initialLen+i] = videosWidgetPlaylistPrefix + w.Playlists[i]
 		}
 	}
 
 	return nil
 }
 
-func (widget *videosWidget) update(ctx context.Context) {
-	videos, err := fetchYoutubeChannelUploads(widget.Channels, widget.VideoUrlTemplate, widget.IncludeShorts, widget.SortBy)
+func (w *videosWidget) update(ctx context.Context) {
+	videos, err := w.fetchYoutubeChannelUploads(w.Channels, w.VideoUrlTemplate, w.IncludeShorts)
 
-	if !widget.canContinueUpdateAfterHandlingErr(err) {
+	if !w.canContinueUpdateAfterHandlingErr(err) {
 		return
 	}
 
-	videos = widget.Filters.Apply(videos)
-
-	if len(videos) > widget.Limit {
-		videos = videos[:widget.Limit]
+	if len(videos) > w.Limit {
+		videos = videos[:w.Limit]
 	}
 
-	widget.Videos = videos
+	w.Videos = videos
 }
 
-func (widget *videosWidget) Render() template.HTML {
+func (w *videosWidget) Render() template.HTML {
 	var template *template.Template
 
-	switch widget.Style {
+	switch w.Style {
 	case "grid-cards":
 		template = videosWidgetGridTemplate
 	case "vertical-list":
@@ -94,7 +91,7 @@ func (widget *videosWidget) Render() template.HTML {
 		template = videosWidgetTemplate
 	}
 
-	return widget.renderTemplate(widget, template)
+	return w.renderTemplate(w, template)
 }
 
 type youtubeFeedResponseXml struct {
@@ -103,7 +100,6 @@ type youtubeFeedResponseXml struct {
 	Videos      []struct {
 		Title     string `xml:"title"`
 		Published string `xml:"published"`
-		Updated   string `xml:"updated"`
 		Link      struct {
 			Href string `xml:"href,attr"`
 		} `xml:"link"`
@@ -132,25 +128,11 @@ type video struct {
 	Author       string
 	AuthorUrl    string
 	TimePosted   time.Time
-	TimeUpdated  time.Time
-}
-
-func (v video) filterableField(field string) any {
-	switch field {
-	case "title":
-		return v.Title
-	case "posted":
-		return v.TimePosted
-	case "updated":
-		return v.TimeUpdated
-	default:
-		return nil
-	}
 }
 
 type videoList []video
 
-func (v videoList) sortByPosted() videoList {
+func (v videoList) sortByNewest() videoList {
 	sort.Slice(v, func(i, j int) bool {
 		return v[i].TimePosted.After(v[j].TimePosted)
 	})
@@ -158,54 +140,42 @@ func (v videoList) sortByPosted() videoList {
 	return v
 }
 
-func (v videoList) sortByUpdated() videoList {
-	sort.Slice(v, func(i, j int) bool {
-		return v[i].TimeUpdated.After(v[j].TimeUpdated)
-	})
+func (w *videosWidget) fetchYoutubeChannelUploads(channelOrPlaylistIDs []string, videoUrlTemplate string, includeShorts bool) (videoList, error) {
+	task := func(id string) (videoList, error) {
+		if cached, ok := w.cachedVideoLists.Load(id); ok {
+			entry := cached.(cachedEntry[videoList])
+			if time.Since(entry.timestamp) < w.cacheDuration {
+				return entry.value, nil
+			}
+		}
 
-	return v
-}
+		list := make(videoList, 0, 15)
 
-func fetchYoutubeChannelUploads(channelOrPlaylistIDs []string, videoUrlTemplate string, includeShorts bool, sortBy string) (videoList, error) {
-	requests := make([]*http.Request, 0, len(channelOrPlaylistIDs))
-
-	for i := range channelOrPlaylistIDs {
-		var feedUrl string
-		if after, ok := strings.CutPrefix(channelOrPlaylistIDs[i], videosWidgetPlaylistPrefix); ok {
-			feedUrl = "https://www.youtube.com/feeds/videos.xml?playlist_id=" + after
-		} else if !includeShorts && strings.HasPrefix(channelOrPlaylistIDs[i], "UC") {
-			playlistId := strings.Replace(channelOrPlaylistIDs[i], "UC", "UULF", 1)
-			feedUrl = "https://www.youtube.com/feeds/videos.xml?playlist_id=" + playlistId
+		var feedURL string
+		if after, ok := strings.CutPrefix(id, videosWidgetPlaylistPrefix); ok {
+			feedURL = "https://www.youtube.com/feeds/videos.xml?playlist_id=" + after
+		} else if !includeShorts && strings.HasPrefix(id, "UC") {
+			playlistId := strings.Replace(id, "UC", "UULF", 1)
+			feedURL = "https://www.youtube.com/feeds/videos.xml?playlist_id=" + playlistId
 		} else {
-			feedUrl = "https://www.youtube.com/feeds/videos.xml?channel_id=" + channelOrPlaylistIDs[i]
+			feedURL = "https://www.youtube.com/feeds/videos.xml?channel_id=" + id
 		}
 
-		request, _ := http.NewRequest("GET", feedUrl, nil)
-		requests = append(requests, request)
-	}
+		request, _ := http.NewRequest("GET", feedURL, nil)
+		response, err := decodeXmlFromRequest[youtubeFeedResponseXml](defaultHTTPClient, request)
+		if err != nil {
+			cached, ok := w.cachedVideoLists.Load(id)
+			if ok {
+				return cached.(cachedEntry[videoList]).value, err
+			}
 
-	job := newJob(decodeXmlFromRequestTask[youtubeFeedResponseXml](defaultHTTPClient), requests).withWorkers(30)
-	responses, errs, err := workerPoolDo(job)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errNoContent, err)
-	}
-
-	videos := make(videoList, 0, len(channelOrPlaylistIDs)*15)
-	var failed int
-
-	for i := range responses {
-		if errs[i] != nil {
-			failed++
-			slog.Error("Failed to fetch youtube feed", "channel", channelOrPlaylistIDs[i], "error", errs[i])
-			continue
+			return list, err
 		}
-
-		response := responses[i]
 
 		for j := range response.Videos {
 			v := &response.Videos[j]
-			var videoUrl string
 
+			var videoUrl string
 			if videoUrlTemplate == "" {
 				videoUrl = v.Link.Href
 			} else {
@@ -218,31 +188,45 @@ func fetchYoutubeChannelUploads(channelOrPlaylistIDs []string, videoUrlTemplate 
 				}
 			}
 
-			videos = append(videos, video{
+			list = append(list, video{
 				ThumbnailUrl: v.Group.Thumbnail.Url,
 				Title:        v.Title,
 				Url:          videoUrl,
 				Author:       response.Channel,
 				AuthorUrl:    response.ChannelLink + "/videos",
 				TimePosted:   parseYoutubeFeedTime(v.Published),
-				TimeUpdated:  parseYoutubeFeedTime(v.Updated),
 			})
+
 		}
+
+		w.cachedVideoLists.Store(id, cachedEntry[videoList]{value: list, timestamp: time.Now()})
+		return list, nil
+	}
+
+	job := newJob(task, channelOrPlaylistIDs).withWorkers(30)
+	lists, errs, err := workerPoolDo(job)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errNoContent, err)
+	}
+
+	videos := make(videoList, 0, len(channelOrPlaylistIDs)*15)
+	var failed int
+
+	for i := range lists {
+		if errs[i] != nil {
+			failed++
+			slog.Error("Failed to fetch youtube feed", "channel", channelOrPlaylistIDs[i], "error", errs[i])
+		}
+
+		// We still append the list even if it failed, because we may have a cached version of the list
+		videos = append(videos, lists[i]...)
 	}
 
 	if len(videos) == 0 {
 		return nil, errNoContent
 	}
 
-	switch sortBy {
-	case "none":
-	case "updated":
-		videos.sortByUpdated()
-	case "posted":
-		videos.sortByPosted()
-	default: // "posted"
-		videos.sortByPosted()
-	}
+	videos.sortByNewest()
 
 	if failed > 0 {
 		return videos, fmt.Errorf("%w: missing videos from %d channels", errPartialContent, failed)
