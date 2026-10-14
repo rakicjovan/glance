@@ -153,6 +153,10 @@ pages:
 
 ## Installation
 
+This fork publishes `ghcr.io/rakicjovan/glance:latest` for AMD64 and ARM64 on every push to `main`.
+Use this image in your Docker Compose configuration to include the RSS image-scraping feature.
+The [GHCR workflow](https://github.com/rakicjovan/glance/actions/workflows/publish-ghcr.yaml) can also be run manually and publishes `main` and `sha-<commit>` tags.
+
 Choose one of the following methods:
 
 <details>

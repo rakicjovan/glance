@@ -1,8 +1,11 @@
-FROM golang:1.27.1-alpine3.24 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.24 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 COPY . /app
-RUN CGO_ENABLED=0 go build .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o glance .
 
 FROM alpine:3.24.1
 
